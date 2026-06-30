@@ -1,79 +1,150 @@
 import asyncio
 import logging
 import os
-import random
-import urllib.parse
 
-import aiohttp
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
-from aiogram.types import Message, BufferedInputFile, FSInputFile
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message
+from google import genai
+from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+client = genai.Client(api_key=GEMINI_API_KEY)
 
-POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}"
+TEXT_MODEL = "gemini-2.5-flash"
+
+SYSTEM_INSTRUCTION = (
+    "Sen \"Abihayat bot\" — Abihayat damlamasi haqida maslahat beruvchi AI "
+    "yordamchisan. Foydalanuvchilar bilan o'zbek tilida (agar boshqa tilda "
+    "yozmasa) do'stona va ishonchli ohangda suhbatlash.\n\n"
+    "MAHSULOT HAQIDA BILIMING:\n"
+    "- Nomi: Abihayat damlamasi\n"
+    "- Tarkibi: zaytun yaprog'i, kekkik (tim/thyme) va dolchin\n"
+    "- Qo'llanilishi: qandli diabet uchun yordamchi vosita sifatida ishlatiladi\n"
+    "- Tabiiyligi: 100% tabiiy mahsulot, Turkiyaning Bursa tog'larida ishlab "
+    "chiqariladi\n"
+    "- Qabul qilish tartibi: kuniga 2 mahal (ertalab va kechqurun) 200 mg "
+    "qaynagan suvga damlanadi va to'q qoringa ichiladi\n"
+    "- Qarshi ko'rsatmalar (ISTE'MOL QILISH MUMKIN EMAS): emizikli "
+    "(laktatsiya davridagi) ayollar va onkologik (saraton) kasalliklarga "
+    "chalingan shaxslar uchun tavsiya etilmaydi\n\n"
+    "QOIDALAR:\n"
+    "- Faqat shu mahsulot bo'yicha so'ralgan savollarga aniq va ishonchli javob ber\n"
+    "- Foydalanuvchi ismini bilsang, suhbatda iliq tarzda ism bilan murojaat qil\n"
+    "- MUHIM: agar foydalanuvchi biror KASALLIK haqida so'rasa (masalan "
+    "\"qandli diabet nima\", \"yurak kasalligi haqida\" va h.k.), JAVOB "
+    "TARTIBI shunday bo'lishi SHART:\n"
+    "  1) Avval o'sha kasallik haqida qisqacha, tushunarli tibbiy ma'lumot ber\n"
+    "  2) Keyin Abihayat damlamasi shu kasallikka qanday yordam berishi "
+    "(yoki YORDAM BERMASLIGI, agar tegishli bo'lmasa yoki qarshi ko'rsatma "
+    "bo'lsa) haqida aniq tushuntir\n"
+    "  Hech qachon bu ikki qadamni aralashtirib yubormang yoki o'tkazib "
+    "yubormang\n"
+    "- Qarshi ko'rsatmalar haqida so'ralganda yoki tegishli holat aniqlanganda "
+    "buni albatta aytib o'tish SHART, hech qachon yashirma\n"
+    "- Tibbiy tashxis qo'yma va dori dozasini o'zgartirishni tavsiya qilma — "
+    "jiddiy savollarda shifokorga murojaat qilishni maslahat ber\n"
+    "- Agar savol mahsulot bilan bog'liq bo'lmasa, qisqa javob berib, "
+    "Abihayat haqida ko'proq gaplashishga taklif qil\n"
+    "- Javoblaring qisqa, tushunarli va samimiy bo'lsin"
+)
+
+# Har bir foydalanuvchi haqida asosiy ma'lumotlarni saqlaymiz
+# (ism, username, chat turi) - bot qayta ishga tushganda tozalanadi
+user_profiles: dict[int, dict] = {}
+
+
+def register_user(message: Message) -> dict:
+    """Foydalanuvchi ma'lumotlarini saqlaydi/yangilaydi va qaytaradi."""
+    user = message.from_user
+    profile = {
+        "first_name": user.first_name or "",
+        "last_name": user.last_name or "",
+        "username": user.username or "",
+        "chat_id": message.chat.id,
+        "chat_type": message.chat.type,
+    }
+    user_profiles[user.id] = profile
+    return profile
+
+
+def build_user_context(profile: dict) -> str:
+    """Profilni system prompt'ga qo'shish uchun matn shaklida tayyorlaydi."""
+    name = profile.get("first_name") or "Foydalanuvchi"
+    return f"[Joriy foydalanuvchi ismi: {name}. Unga ism bilan murojaat qilishing mumkin.]"
+
+
+# Har bir foydalanuvchi uchun suhbat tarixini xotirada saqlaymiz
+# (bot qayta ishga tushganda tozalanadi)
+user_histories: dict[int, list[types.Content]] = {}
+MAX_HISTORY_MESSAGES = 20  # xotira cheklovi (eski xabarlarni unutib boradi)
 
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
-    welcome_text = (
-        "🎨 <b>RasmAI</b>ga xush kelibsiz!\n\n"
-        "✨ Menga xohlagan tasvirni so'z bilan yozing — men uni jonlantiraman.\n\n"
-        "💡 <b>Masalan:</b>\n"
-        "🌅 <i>\"Tog'lar orasida quyosh botishi, real fotosurat uslubida\"</i>\n"
-        "🐉 <i>\"Bulutlar ustida uchayotgan ajdaho, fantastik uslub\"</i>\n"
-        "🏙 <i>\"Kechki Toshkent shahri, neon chiroqlar bilan\"</i>\n\n"
-        "👇 Hoziroq birinchi rasmingizni so'rang!"
+    user_histories.pop(message.from_user.id, None)
+    user_profiles.pop(message.from_user.id, None)
+    register_user(message)
+    await message.answer(
+        "👋🌿 Salom! Men <b>Abihayat damlamasi</b> bo'yicha aqlli AI "
+        "yordamchiman va sizga damlama haqida hamda kasalliklar haqida "
+        "yordam beraman!\n\n"
+        "💬 Kasallik yoki damlama bo'yicha savolingiz bo'lsa, menga yozing! 😊",
+        parse_mode="HTML",
     )
-    if os.path.isfile("bot_logo.png"):
-        photo = FSInputFile("bot_logo.png")
-        await message.answer_photo(photo, caption=welcome_text, parse_mode="HTML")
-    else:
-        await message.answer(welcome_text, parse_mode="HTML")
+
+
+@dp.message(Command("reset"))
+async def reset_handler(message: Message):
+    user_histories.pop(message.from_user.id, None)
+    await message.answer("🔄 Suhbat tarixi tozalandi. Yangi suhbat boshlandi!")
 
 
 @dp.message(F.text)
-async def generate_image_handler(message: Message):
-    prompt = message.text.strip()
-    if not prompt:
+async def chat_handler(message: Message):
+    user_text = message.text.strip()
+    if not user_text:
         return
 
-    status_msg = await message.answer("Rasm yaratilmoqda, biroz kuting...")
+    user_id = message.from_user.id
+    profile = register_user(message)
+    history = user_histories.setdefault(user_id, [])
+
+    history.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+
+    # Xotirani cheklash - faqat oxirgi N xabarni yuboramiz
+    trimmed_history = history[-MAX_HISTORY_MESSAGES:]
+
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
 
     try:
-        encoded_prompt = urllib.parse.quote(prompt)
-        seed = random.randint(1, 999999)
-        url = (
-            f"{POLLINATIONS_URL.format(prompt=encoded_prompt)}"
-            f"?width=1024&height=1024&seed={seed}&nologo=true"
-            f"&model=flux&nofeed=true"
+        full_system_instruction = f"{SYSTEM_INSTRUCTION}\n\n{build_user_context(profile)}"
+
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=TEXT_MODEL,
+            contents=trimmed_history,
+            config=types.GenerateContentConfig(
+                system_instruction=full_system_instruction,
+            ),
         )
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                headers={"Cache-Control": "no-cache"},
-                timeout=aiohttp.ClientTimeout(total=90),
-            ) as resp:
-                if resp.status != 200:
-                    await status_msg.edit_text(
-                        f"Xatolik yuz berdi (status {resp.status}). Qaytadan urinib ko'ring."
-                    )
-                    return
-                image_bytes = await resp.read()
+        reply_text = response.text or "Kechirasiz, javob bera olmadim. Qaytadan urinib ko'ring."
 
-        photo = BufferedInputFile(image_bytes, filename="generated.png")
-        await message.answer_photo(photo, caption=f'"{prompt}"')
-        await status_msg.delete()
+        history.append(types.Content(role="model", parts=[types.Part.from_text(text=reply_text)]))
+        user_histories[user_id] = history[-MAX_HISTORY_MESSAGES:]
+
+        await message.answer(reply_text)
 
     except Exception as e:
-        logging.exception("Image generation failed")
-        await status_msg.edit_text(f"Xatolik yuz berdi: {e}")
+        logging.exception("Chat generation failed")
+        await message.answer(f"Xatolik yuz berdi: {e}")
 
 
 async def main():
