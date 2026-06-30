@@ -30,10 +30,10 @@ async def start_handler(message: Message):
         "🏙 <i>\"Kechki Toshkent shahri, neon chiroqlar bilan\"</i>\n\n"
         "👇 Hoziroq birinchi rasmingizni so'rang!"
     )
-    try:
+    if os.path.isfile("bot_logo.png"):
         photo = FSInputFile("bot_logo.png")
         await message.answer_photo(photo, caption=welcome_text, parse_mode="HTML")
-    except FileNotFoundError:
+    else:
         await message.answer(welcome_text, parse_mode="HTML")
 
 
