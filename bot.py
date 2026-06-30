@@ -1,23 +1,22 @@
 import asyncio
-import base64
 import logging
 import os
+import random
+import urllib.parse
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, BufferedInputFile
-from google import genai
 
 logging.basicConfig(level=logging.INFO)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-client = genai.Client(api_key=GEMINI_API_KEY)
 
-IMAGE_MODEL = "gemini-2.5-flash-image"
+POLLINATIONS_URL = "https://image.pollinations.ai/prompt/{prompt}"
 
 
 @dp.message(CommandStart())
@@ -38,27 +37,18 @@ async def generate_image_handler(message: Message):
     status_msg = await message.answer("Rasm yaratilmoqda, biroz kuting...")
 
     try:
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=IMAGE_MODEL,
-            contents=prompt,
-        )
+        encoded_prompt = urllib.parse.quote(prompt)
+        seed = random.randint(1, 999999)
+        url = f"{POLLINATIONS_URL.format(prompt=encoded_prompt)}?width=1024&height=1024&seed={seed}&nologo=true"
 
-        image_bytes = None
-        for part in response.candidates[0].content.parts:
-            if getattr(part, "inline_data", None) is not None:
-                image_bytes = part.inline_data.data
-                break
-
-        if image_bytes is None:
-            await status_msg.edit_text(
-                "Kechirasiz, rasm yaratib bo'lmadi. Boshqacha so'rov bilan urinib ko'ring."
-            )
-            return
-
-        # inline_data.data sometimes comes already as raw bytes, sometimes base64 str
-        if isinstance(image_bytes, str):
-            image_bytes = base64.b64decode(image_bytes)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=90)) as resp:
+                if resp.status != 200:
+                    await status_msg.edit_text(
+                        f"Xatolik yuz berdi (status {resp.status}). Qaytadan urinib ko'ring."
+                    )
+                    return
+                image_bytes = await resp.read()
 
         photo = BufferedInputFile(image_bytes, filename="generated.png")
         await message.answer_photo(photo, caption=f'"{prompt}"')
